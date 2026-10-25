@@ -13,6 +13,7 @@ import {
   computeActionId,
   type ActionRequest,
   type ToolName,
+  type Hex,
 } from "@aegis/shared";
 import { AuditDatabase } from "./services/auditDb.js";
 import { PolicyClient } from "./services/policyClient.js";
@@ -57,6 +58,11 @@ export function buildGatewayServer(config: GatewayServerConfig): FastifyInstance
     return auditDb.getAllActions();
   });
 
+  // Get unanchored actions awaiting receipt commitment
+  app.get("/actions/unanchored", async () => {
+    return auditDb.getUnanchoredActions();
+  });
+
   // Get specific audit action
   app.get("/actions/:actionId", async (request, reply) => {
     const { actionId } = request.params as { actionId: string };
@@ -65,6 +71,109 @@ export function buildGatewayServer(config: GatewayServerConfig): FastifyInstance
       return reply.code(404).send({ error: "Action not found" });
     }
     return record;
+  });
+
+  // Get immutable audit event stream for a specific action
+  app.get("/actions/:actionId/events", async (request, reply) => {
+    const { actionId } = request.params as { actionId: string };
+    const action = auditDb.getAction(actionId);
+    if (!action) {
+      return reply.code(404).send({ error: "Action not found" });
+    }
+    return auditDb.getEventsForAction(actionId);
+  });
+
+  // Retry receipt commitment for an unanchored action without re-executing host tools
+  app.post("/actions/:actionId/retry-receipt", async (request, reply) => {
+    const { actionId } = request.params as { actionId: string };
+    const action = auditDb.getAction(actionId);
+    if (!action) {
+      return reply.code(404).send({ error: "ERR_ACTION_NOT_FOUND", message: `Action ${actionId} not found` });
+    }
+
+    if (action.receiptTxHash && action.status === "EXECUTED") {
+      return reply.code(200).send({
+        success: true,
+        actionId,
+        receiptTxHash: action.receiptTxHash,
+        status: "EXECUTED",
+        message: "Receipt is already anchored on-chain",
+      });
+    }
+
+    if (!action.resultHash) {
+      return reply.code(400).send({
+        error: "ERR_NO_RESULT_HASH",
+        message: "Action has no execution resultHash available to anchor on-chain",
+      });
+    }
+
+    try {
+      const commitRes = await policyClient.commitReceipt(
+        action.actionId as Hex,
+        action.grantId as Hex,
+        action.resultHash as Hex
+      );
+
+      auditDb.recordReceipt(action.actionId, action.resultHash, {
+        receiptTxHash: commitRes.txHash,
+        status: "EXECUTED",
+      });
+
+      return reply.code(200).send({
+        success: true,
+        actionId,
+        receiptTxHash: commitRes.txHash,
+        status: "EXECUTED",
+      });
+    } catch (err: any) {
+      const reason = extractRevertReason(err);
+      auditDb.appendEvent({
+        actionId,
+        eventType: "RETRY_ANCHORING_FAILED",
+        previousStatus: action.status,
+        newStatus: action.status,
+        dataJson: JSON.stringify({ error: reason }),
+      });
+
+      return reply.code(500).send({
+        success: false,
+        actionId,
+        error: "ERR_RECEIPT_ANCHORING_FAILED",
+        details: reason,
+      });
+    }
+  });
+
+  // Verify or submit receipt idempotently; rejects conflicting receipts
+  app.post("/actions/:actionId/receipt", async (request, reply) => {
+    const { actionId } = request.params as { actionId: string };
+    const { resultHash } = request.body as { resultHash: Hex };
+
+    if (!resultHash || !/^0x[0-9a-fA-F]{64}$/.test(resultHash)) {
+      return reply.code(400).send({ error: "ERR_INVALID_RESULT_HASH", message: "Must be a 32-byte hex hash" });
+    }
+
+    try {
+      const res = auditDb.recordReceipt(actionId, resultHash);
+      return reply.code(200).send({
+        success: true,
+        actionId,
+        resultHash,
+        alreadyAnchored: res.alreadyAnchored,
+      });
+    } catch (err: any) {
+      if (err.message.includes("ERR_CONFLICTING_RECEIPT")) {
+        return reply.code(409).send({
+          error: "ERR_CONFLICTING_RECEIPT",
+          message: err.message,
+        });
+      }
+      if (err.message.includes("ERR_ACTION_NOT_FOUND")) {
+        return reply.code(404).send({ error: "ERR_ACTION_NOT_FOUND", message: err.message });
+      }
+      return reply.code(500).send({ error: "ERR_INTERNAL", message: err.message });
+    }
   });
 
   // Get on-chain grant details
@@ -134,17 +243,19 @@ export function buildGatewayServer(config: GatewayServerConfig): FastifyInstance
         sub.actionId ??
         computeActionId(sub.grantId, BigInt(sub.nonce), toolBit);
 
-      auditDb.recordRequest({
-        actionId,
-        grantId: sub.grantId,
-        agentAddress: "0x0000000000000000000000000000000000000000",
-        toolName: sub.toolName,
-        cost: sub.cost,
-        params: sub.params,
-        paramsHash: pHash,
-        status: "DENIED",
-        decisionReason: `Schema validation error: ${schemaErr.message}`,
-      });
+      try {
+        auditDb.recordRequest({
+          actionId,
+          grantId: sub.grantId,
+          agentAddress: "0x0000000000000000000000000000000000000000",
+          toolName: sub.toolName,
+          cost: sub.cost,
+          params: sub.params,
+          paramsHash: pHash,
+          status: "DENIED",
+          decisionReason: `Schema validation error: ${schemaErr.message}`,
+        });
+      } catch {}
 
       return reply.code(400).send({
         error: "ERR_INVALID_TOOL_PARAMETERS",
@@ -177,30 +288,42 @@ export function buildGatewayServer(config: GatewayServerConfig): FastifyInstance
     }
 
     if (grant.grantId === "0x0000000000000000000000000000000000000000000000000000000000000000") {
+      try {
+        auditDb.recordRequest({
+          actionId,
+          grantId: sub.grantId,
+          agentAddress: "0x0000000000000000000000000000000000000000",
+          toolName: sub.toolName,
+          cost: sub.cost,
+          params: validatedParams,
+          paramsHash: pHash,
+          status: "DENIED",
+          decisionReason: "Grant does not exist",
+        });
+      } catch {}
+      return reply.code(404).send({ error: "ERR_GRANT_NOT_FOUND" });
+    }
+
+    try {
       auditDb.recordRequest({
         actionId,
         grantId: sub.grantId,
-        agentAddress: "0x0000000000000000000000000000000000000000",
+        agentAddress: grant.agent,
         toolName: sub.toolName,
         cost: sub.cost,
         params: validatedParams,
         paramsHash: pHash,
-        status: "DENIED",
-        decisionReason: "Grant does not exist",
+        status: "REQUESTED",
       });
-      return reply.code(404).send({ error: "ERR_GRANT_NOT_FOUND" });
+    } catch (conflictErr: any) {
+      if (conflictErr.message.includes("ERR_ACTION_ID_CONFLICT")) {
+        return reply.code(409).send({
+          error: "ERR_ACTION_ID_CONFLICT",
+          details: conflictErr.message,
+        });
+      }
+      throw conflictErr;
     }
-
-    auditDb.recordRequest({
-      actionId,
-      grantId: sub.grantId,
-      agentAddress: grant.agent,
-      toolName: sub.toolName,
-      cost: sub.cost,
-      params: validatedParams,
-      paramsHash: pHash,
-      status: "REQUESTED",
-    });
 
     // 5. Verify EIP-712 signature locally
     let isSigValid = false;
@@ -261,26 +384,55 @@ export function buildGatewayServer(config: GatewayServerConfig): FastifyInstance
 
     // 8. Handle tool outcome & commit receipt hash on-chain
     if (toolResult.success) {
-      try {
-        await policyClient.commitReceipt(actionId, sub.grantId, toolResult.resultHash);
-      } catch (commitErr) {
-        // Receipt commitment error is logged but execution already occurred
-      }
-
-      auditDb.updateStatus(actionId, "EXECUTED", {
-        resultHash: toolResult.resultHash,
+      // Record execution evidence first before on-chain commit attempt
+      auditDb.recordReceipt(actionId, toolResult.resultHash, {
         outputSummary: toolResult.output.slice(0, 500),
+        status: "UNANCHORED",
       });
 
-      return reply.code(200).send({
-        success: true,
-        actionId,
-        toolName: sub.toolName,
-        cost: sub.cost,
-        resultHash: toolResult.resultHash,
-        output: toolResult.output,
-        txHash: preConsumeTx,
-      });
+      try {
+        const commitRes = await policyClient.commitReceipt(
+          actionId,
+          sub.grantId,
+          toolResult.resultHash
+        );
+
+        auditDb.recordReceipt(actionId, toolResult.resultHash, {
+          receiptTxHash: commitRes.txHash,
+          status: "EXECUTED",
+        });
+
+        return reply.code(200).send({
+          success: true,
+          actionId,
+          toolName: sub.toolName,
+          cost: sub.cost,
+          resultHash: toolResult.resultHash,
+          output: toolResult.output,
+          txHash: preConsumeTx,
+          receiptTxHash: commitRes.txHash,
+          status: "EXECUTED",
+        });
+      } catch (commitErr: any) {
+        // Tool executed on host, but receipt anchoring failed on-chain
+        const reason = extractRevertReason(commitErr);
+        auditDb.updateStatus(actionId, "UNANCHORED", {
+          decisionReason: `Receipt anchoring failed: ${reason}`,
+        });
+
+        return reply.code(202).send({
+          success: true,
+          actionId,
+          toolName: sub.toolName,
+          cost: sub.cost,
+          resultHash: toolResult.resultHash,
+          output: toolResult.output,
+          txHash: preConsumeTx,
+          status: "UNANCHORED",
+          warning: "Tool executed successfully on host, but on-chain receipt anchoring failed. Recoverable via POST /actions/:actionId/retry-receipt",
+          details: reason,
+        });
+      }
     } else {
       // Conservative failure mode: on-chain budget remains pre-consumed to prevent exhaustion attacks
       auditDb.updateStatus(actionId, "FAILED", {

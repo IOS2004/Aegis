@@ -114,20 +114,41 @@ The **Execution Gateway** is a hardened Node.js/TypeScript service that serves a
   - `create_sandbox_branch`: Executes safe `git checkout -b <sanitized-name>` in a designated scratch repo.
   - `write_demo_file`: Writes sanitized data strictly within `<sandbox_root>/demo/`, forbidding path traversal.
 
+#### 3.2.1 Sandbox Boundary & Security Isolation
+To prevent ambiguity, the sandbox boundary explicitly delineates between application-level controls and OS-enforced primitives:
+
+- **Application-Level Protections (Enforced by Gateway):**
+  1. *Strict Zod Parameter Schemas:* All tool inputs are validated by strict Zod schemas with regex constraints and `.strict()` disallowing extraneous properties or prototype injection.
+  2. *Path Confinement & Symlink Defense:* All file operations are canonicalized using `path.resolve` and `fs.realpathSync`. Any path resolving outside `<sandbox_root>/demo` or using `..` traversals is rejected prior to filesystem interaction. Symbolic links pointing outside the sandbox directory are prohibited.
+  3. *Zero Shell Invocation:* Child processes execute binary executables directly via `child_process.execFile` with pre-sanitized argument vectors (e.g. `["checkout", "-B", branchName]`). No shell (`/bin/sh -c` or `cmd.exe /c`) is ever invoked, eliminating shell metacharacter injection (`;`, `|`, `&&`, `$()`). Branch names are restricted to safe alphanumeric characters and forbidden from starting with `-` to block command-line option injection.
+  4. *Resource Throttles:* Mandatory application timeouts (5000ms default) and output buffer truncation (50KB cap) prevent host memory exhaustion and denial-of-service.
+
+- **Operating-System Level Protections (Enforced by OS Kernel):**
+  1. *Process Signal Termination:* Kernel-level `SIGTERM` / `SIGKILL` delivery when application timeout thresholds expire.
+  2. *Filesystem Access Control:* Operations are bounded by the OS file permissions and UID/GID of the running Gateway service process.
+
+- **Explicit Sandbox Limitations & Production Container Roadmap:**
+  - *Current Prototype Limitation:* The current prototype does **not** employ Linux kernel namespaces (`cgroups`, `unshare`, `pivot_root`) or Windows Job Objects / AppContainers. Child processes run under the Gateway host process account.
+  - *Production Roadmap:* In production deployments, tools should execute inside ephemeral rootless OCI containers (Docker / Podman / gVisor sandbox) or dedicated unprivileged OS accounts with read-only root filesystems and drop-all Linux capabilities (`CAP_DROP_ALL`).
+
 ### 3.3 Layer 3: Agent Adapter Layer
 - **`AgentAdapter` Interface:** Standard abstraction for agent behavior (`proposeAction(context) -> ActionRequest`).
 - **`MockAgentAdapter`:** Deterministic agent supplying pre-scripted valid and adversarial action sequences for 100% reproducible testing.
 - **`LLMAgentAdapter`:** Optional extension consuming structured tool definitions. The model only outputs structured JSON requests; it has zero access to signing keys, raw shell commands, or network credentials.
 
 ### 3.4 Layer 4: Audit & Persistence Layer
-- **SQLite Audit DB:** Off-chain, queryable log of all actions (`actionId`, `grantId`, `agentAddress`, `toolName`, `paramsHash`, `status`, `decisionReason`, `executionResultHash`, `timestamp`).
-- **On-Chain Audit Events:** Minimal, privacy-preserving events (`ActionAuthorized`, `ActionExecuted`, `GrantRevoked`, `ReceiptCommitted`) carrying only hashes and IDs, keeping private data and prompts off-chain.
+- **Dual-Table SQLite Audit Architecture:**
+  1. `actions` (Mutable Current State): Tracks entity state across `REQUESTED`, `AUTHORIZED`, `EXECUTING`, `EXECUTED`, `UNANCHORED`, `FAILED`, and `DENIED`. Records `resultHash`, execution evidence, `txHash`, and `receiptTxHash`.
+  2. `audit_events` (Append-Only Event Stream): Immutable log recording every lifecycle transition (`REQUEST_RECORDED`, `STATUS_CHANGED`, `RECEIPT_ANCHORED`, `RECEIPT_RECORDED_UNANCHORED`, `DUPLICATE_RECEIPT_SUBMITTED`, `CONFLICTING_RECEIPT_REJECTED`, `CONFLICTING_REQUEST_REJECTED`).
+- **Idempotency & Conflict Rejection:** Duplicate requests and receipts with identical cryptographic hashes are handled idempotently. Requests or receipts with conflicting parameters or mismatched hashes for an existing `actionId` are strictly rejected with HTTP 409 (`ERR_ACTION_ID_CONFLICT` / `ERR_CONFLICTING_RECEIPT`) without overwriting history.
+- **Recoverable Receipt Lifecycle:** If tool execution succeeds on the host but on-chain receipt anchoring fails (e.g. transient network or RPC error), the action transitions to `UNANCHORED`. Execution evidence (`resultHash`, output summary) is permanently preserved. The Gateway provides a dedicated recovery endpoint (`POST /actions/:actionId/retry-receipt`) allowing the operator or automated relayer to anchor the receipt on-chain without re-running the tool.
+- **On-Chain Receipt Anchoring:** Minimal, privacy-preserving events (`ActionAuthorized`, `ReceiptCommitted`) carrying only hashes and IDs, keeping private data and host outputs off-chain.
 
 ### 3.5 Layer 5: Operator Dashboard (Frontend)
 - Built with React, TypeScript, Vite, and `viem`.
 - Real-time visualization of the grant delegation tree (Owner $\to$ Agent A $\to$ Agent B).
 - Display of live quotas: aggregate budget, spent units, reserved child budget, per-action cap, and expiry countdown.
-- Interactive audit log displaying allow/deny decisions with exact machine-readable reason codes.
+- Interactive audit log displaying allow/deny decisions with exact machine-readable reason codes, receipt anchoring status, and unanchored action recovery controls.
 
 ---
 

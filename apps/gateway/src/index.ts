@@ -5,7 +5,7 @@ import { AuditDatabase } from "./services/auditDb.js";
 import { PolicyClient } from "./services/policyClient.js";
 import { SandboxEnvironment } from "./tools/sandbox.js";
 
-const PORT = Number(process.env.PORT || 3001);
+const PORT = Number(process.env.PORT || 3000);
 const RPC_URL = process.env.RPC_URL || "http://127.0.0.1:8545";
 const CHAIN_ID = Number(process.env.CHAIN_ID || 31337);
 const POLICY_MANAGER_ADDRESS = (process.env.POLICY_MANAGER_ADDRESS || "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512") as `0x${string}`;

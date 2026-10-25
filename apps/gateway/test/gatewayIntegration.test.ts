@@ -544,4 +544,143 @@ describe("Aegis Gateway End-to-End Integration & Security Matrix", () => {
     expect(grantAfterRetry.spent).toBe(25n); // 15 + 10
     expect(grantAfterRetry.nonce).toBe(2n);
   });
+
+  it("16. should handle interruption after execution, persist unanchored evidence, and support idempotent retry-receipt", async () => {
+    // Fresh grant for unanchored receipt recovery testing
+    const now = BigInt(Math.floor(Date.now() / 1000));
+    const expiry = now + 86400n;
+    const createTx = await ownerWallet.writeContract({
+      address: POLICY_MANAGER_ADDR,
+      abi: parseAbi([
+        "function createRootGrant(address,uint256,uint64,uint256,uint256) returns (bytes32)",
+      ]),
+      functionName: "createRootGrant",
+      args: [agentB.address, 0x0Fn, expiry, 50n, 100n],
+      account: ownerWallet.account!,
+      chain: undefined,
+    });
+    const receipt = await publicClient.waitForTransactionReceipt({ hash: createTx });
+    const recoveryGrantId = receipt.logs[0].topics[1] as Hex;
+
+    // Simulate transient failure during commitReceipt (interruption after tool execution)
+    const originalCommit = policyClient.commitReceipt.bind(policyClient);
+    let failCommitOnce = true;
+    policyClient.commitReceipt = async (actionId, grantId, receiptHash) => {
+      if (failCommitOnce) {
+        failCommitOnce = false;
+        throw new Error("Simulated network timeout during receipt anchoring");
+      }
+      return originalCommit(actionId, grantId, receiptHash);
+    };
+
+    const actionSub = await agentB.createValidWriteFile(
+      recoveryGrantId,
+      0,
+      "unanchored-proof.txt",
+      "Persistent execution proof"
+    );
+
+    const executeRes = await app.inject({
+      method: "POST",
+      url: "/action",
+      payload: actionSub,
+    });
+
+    // 1. Tool execution succeeded on host, but receipt anchoring failed -> 202 UNANCHORED
+    expect(executeRes.statusCode).toBe(202);
+    const body = executeRes.json();
+    expect(body.status).toBe("UNANCHORED");
+    expect(body.warning).toContain("POST /actions/:actionId/retry-receipt");
+    expect(body.resultHash).toBeDefined();
+
+    // Verify host file was written
+    const writtenFile = path.join(tempDir, "demo", "unanchored-proof.txt");
+    expect(fs.existsSync(writtenFile)).toBe(true);
+
+    // Verify database record has UNANCHORED status and execution resultHash preserved
+    const actionRecord = auditDb.getAction(actionSub.actionId!);
+    expect(actionRecord?.status).toBe("UNANCHORED");
+    expect(actionRecord?.resultHash).toBe(body.resultHash);
+
+    // Verify unanchored query returns this action
+    const unanchoredList = auditDb.getUnanchoredActions();
+    expect(unanchoredList.some((a) => a.actionId === actionSub.actionId)).toBe(true);
+
+    // 2. Retry receipt commitment via recovery endpoint (re-uses existing evidence, does NOT re-run tool)
+    const retryReceiptRes = await app.inject({
+      method: "POST",
+      url: `/actions/${actionSub.actionId}/retry-receipt`,
+    });
+
+    expect(retryReceiptRes.statusCode).toBe(200);
+    const retryBody = retryReceiptRes.json();
+    expect(retryBody.success).toBe(true);
+    expect(retryBody.status).toBe("EXECUTED");
+    expect(retryBody.receiptTxHash).toBeDefined();
+
+    // Verify database status is now EXECUTED with receiptTxHash
+    const updatedRecord = auditDb.getAction(actionSub.actionId!);
+    expect(updatedRecord?.status).toBe("EXECUTED");
+    expect(updatedRecord?.receiptTxHash).toBe(retryBody.receiptTxHash);
+
+    // Verify action is no longer in unanchored list
+    const unanchoredAfter = auditDb.getUnanchoredActions();
+    expect(unanchoredAfter.some((a) => a.actionId === actionSub.actionId)).toBe(false);
+
+    // 3. Duplicate retry-receipt submission must be idempotent
+    const duplicateRetryRes = await app.inject({
+      method: "POST",
+      url: `/actions/${actionSub.actionId}/retry-receipt`,
+    });
+    expect(duplicateRetryRes.statusCode).toBe(200);
+    expect(duplicateRetryRes.json().receiptTxHash).toBe(retryBody.receiptTxHash);
+    expect(duplicateRetryRes.json().message).toContain("already anchored");
+
+    // 4. Conflicting receipt submission with different resultHash must be strictly rejected
+    const conflictingRes = await app.inject({
+      method: "POST",
+      url: `/actions/${actionSub.actionId}/receipt`,
+      payload: {
+        resultHash: "0x" + "a".repeat(64),
+      },
+    });
+    expect(conflictingRes.statusCode).toBe(409);
+    expect(conflictingRes.json().error).toBe("ERR_CONFLICTING_RECEIPT");
+
+    // Restore original commit function
+    policyClient.commitReceipt = originalCommit;
+  });
+
+  it("17. should reject conflicting request using an existing actionId with 409 Conflict", async () => {
+    const actionId = "0x" + "c".repeat(64) as Hex;
+    const initialSub = await agentB.createValidReadStatus(rootGrantId, 99);
+    // Explicitly set actionId
+    initialSub.actionId = actionId;
+
+    // Submit valid action (fails on nonce or budget or succeeds, but records in DB)
+    await app.inject({
+      method: "POST",
+      url: "/action",
+      payload: initialSub,
+    });
+
+    // Attempt to submit a conflicting request reusing the same actionId but with different cost/tool
+    const conflictingSub = {
+      ...initialSub,
+      cost: 99, // different cost!
+    };
+
+    const conflictRes = await app.inject({
+      method: "POST",
+      url: "/action",
+      payload: conflictingSub,
+    });
+
+    expect(conflictRes.statusCode).toBe(409);
+    expect(conflictRes.json().error).toBe("ERR_ACTION_ID_CONFLICT");
+
+    const events = auditDb.getEventsForAction(actionId);
+    const rejectedEvent = events.find((e) => e.eventType === "CONFLICTING_REQUEST_REJECTED");
+    expect(rejectedEvent).toBeDefined();
+  });
 });

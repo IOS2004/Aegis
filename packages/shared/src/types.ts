@@ -54,6 +54,7 @@ export type ActionExecutionStatus =
   | 'AUTHORIZED'
   | 'EXECUTING'
   | 'EXECUTED'
+  | 'UNANCHORED'
   | 'FAILED'
   | 'DENIED'
   | 'TIMEOUT';
@@ -69,5 +70,6 @@ export interface ActionReceipt {
   decisionReason?: string;
   outputSummary?: string;
   txHash?: Hex;
+  receiptTxHash?: Hex;
   timestamp: number;
 }
